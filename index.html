@@ -8,11 +8,10 @@
 <meta name="description" content="Track shipments and manage package deliveries with LEXORA LOGISTICS."/>
 <title>LEXORA LOGISTICS | Global Shipping & Tracking</title>
 
-<!-- Firebase SDK (Compat) -->
+<!-- Firebase SDK (Compat): Auth + Firestore. Package images upload to Cloudinary. -->
 <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-storage-compat.js"></script>
 
 <!-- Leaflet.js -->
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
@@ -2706,7 +2705,7 @@ h1,h2,h3,h4,.nav-brand-name,.card-title,.pg-title,.auth-title,.ft-brand h3,.team
    1.  APP STATE
    ────────────────────────────────────────────── */
 const A = {
-  db: null, auth: null, storage: null, user: null,
+  db: null, auth: null, user: null,
   ships: [],
   etaTimer: null, mapTimer: null,
   mapInst: null, movMarker: null,
@@ -2739,13 +2738,18 @@ const firebaseConfig = {
   appId:             "1:92242001554:web:a1988ff15442e81c52304b"
 };
 
+// Cloudinary handles package photos so Firebase Storage billing is not required.
+// These are public configuration values for an unsigned upload preset; NEVER put
+// a Cloudinary API secret in browser code.
+const CLOUDINARY_CLOUD_NAME = 'j7ivv8by';
+const CLOUDINARY_UPLOAD_PRESET = 'valorcarimg';
+const CLOUDINARY_MAX_FILE_BYTES = 10 * 1024 * 1024;
+
 function initFB() {
   try {
     firebase.initializeApp(firebaseConfig);
     A.db   = firebase.firestore();
     A.auth = firebase.auth();
-    try { A.storage = firebase.storage(); }
-    catch (storageError) { console.warn('Firebase Storage is unavailable; package-photo uploads will not work until Storage is enabled.', storageError); }
     return true;
   } catch(e) { console.error('Firebase init error:', e); return false; }
 }
@@ -3169,7 +3173,7 @@ function handlePackageImage(event) {
     event.target.value = '';
     return;
   }
-  if (file.size > 10 * 1024 * 1024) {
+  if (file.size > CLOUDINARY_MAX_FILE_BYTES) {
     toast('warning', 'Photo is too large', 'Choose an image smaller than 10 MB.');
     event.target.value = '';
     return;
@@ -3220,32 +3224,70 @@ async function optimizePackageImage(file) {
 async function uploadPackageImage(trackingCode) {
   if (removeCurrentPackageImage) return '';
   if (!pendingPackageImage) return currentPackageImageUrl || '';
-  if (!A.storage) throw new Error('Package-photo storage is unavailable. Enable Firebase Storage and check its security rules, then try again.');
+  if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_UPLOAD_PRESET) {
+    throw new Error('Cloudinary is not configured. Check the cloud name and unsigned upload preset in the website code.');
+  }
+
   const progress = document.getElementById('f-image-progress');
   const bar = document.getElementById('f-image-progress-bar');
   const label = document.getElementById('f-image-progress-label');
   if (progress) progress.hidden = false;
+  if (bar) bar.style.width = '0%';
   if (label) label.textContent = 'Optimizing package photo…';
-  const blob = await optimizePackageImage(pendingPackageImage);
-  const isWebp = blob.type === 'image/webp';
-  const extension = isWebp ? 'webp' : (pendingPackageImage.name.split('.').pop() || 'jpg').toLowerCase().replace(/[^a-z0-9]/g, '') || 'jpg';
-  const contentType = blob.type || pendingPackageImage.type || 'image/jpeg';
-  const safeCode = String(trackingCode || 'shipment').replace(/[^a-zA-Z0-9_-]/g, '_');
-  const ref = A.storage.ref().child(`package-images/${safeCode}/${Date.now()}.${extension}`);
-  return await new Promise((resolve, reject) => {
-    const task = ref.put(blob, { contentType, cacheControl: 'public,max-age=3600' });
-    task.on('state_changed', snapshot => {
-      const percent = snapshot.totalBytes ? Math.round(snapshot.bytesTransferred / snapshot.totalBytes * 100) : 0;
-      if (bar) bar.style.width = percent + '%';
-      if (label) label.textContent = `Uploading photo · ${percent}%`;
-    }, reject, async () => {
-      try {
-        const url = await task.snapshot.ref.getDownloadURL();
-        if (label) label.textContent = 'Photo uploaded';
-        resolve(url);
-      } catch (err) { reject(err); }
+
+  try {
+    const blob = await optimizePackageImage(pendingPackageImage);
+    const contentType = blob.type || pendingPackageImage.type || 'image/jpeg';
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp'];
+    if (!allowedTypes.includes(contentType)) {
+      throw new Error('This photo format is not supported by the current upload preset. Please choose a JPG, PNG, or WebP image.');
+    }
+
+    const safeCode = String(trackingCode || 'shipment').replace(/[^a-zA-Z0-9_-]/g, '_');
+    const ext = contentType === 'image/webp' ? 'webp' : contentType === 'image/png' ? 'png' : 'jpg';
+    const uploadName = `${safeCode}-${Date.now()}.${ext}`;
+    const formData = new FormData();
+    formData.append('file', blob, uploadName);
+    formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
+    // Folder path organizes the files in Cloudinary. It is an allowed unsigned parameter.
+    formData.append('folder', 'lexora-package-images');
+
+    if (label) label.textContent = 'Uploading package photo…';
+    const endpoint = `https://api.cloudinary.com/v1_1/${encodeURIComponent(CLOUDINARY_CLOUD_NAME)}/image/upload`;
+
+    const result = await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', endpoint, true);
+      xhr.timeout = 120000;
+      xhr.upload.onprogress = event => {
+        if (!event.lengthComputable) return;
+        const percent = Math.round((event.loaded / event.total) * 100);
+        if (bar) bar.style.width = percent + '%';
+        if (label) label.textContent = `Uploading photo · ${percent}%`;
+      };
+      xhr.onload = () => {
+        let body = {};
+        try { body = JSON.parse(xhr.responseText || '{}'); } catch (_) {}
+        if (xhr.status >= 200 && xhr.status < 300 && body.secure_url) {
+          resolve(body);
+          return;
+        }
+        const providerMessage = body?.error?.message;
+        reject(new Error(providerMessage || `Cloudinary upload failed (HTTP ${xhr.status}). Check the cloud name and unsigned upload preset.`));
+      };
+      xhr.onerror = () => reject(new Error('Could not connect to Cloudinary. Check your internet connection and try again.'));
+      xhr.ontimeout = () => reject(new Error('The package photo upload timed out. Try a smaller photo or a more stable connection.'));
+      xhr.send(formData);
     });
-  });
+
+    if (bar) bar.style.width = '100%';
+    if (label) label.textContent = 'Photo uploaded';
+    return result.secure_url;
+  } catch (err) {
+    if (progress) progress.hidden = true;
+    if (bar) bar.style.width = '0%';
+    throw err;
+  }
 }
 
 function editShipmentForm(id) {
